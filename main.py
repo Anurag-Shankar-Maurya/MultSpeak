@@ -1,6 +1,6 @@
 import os
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import filedialog, messagebox
 import numpy as np
 import librosa
 import sounddevice as sd
@@ -30,6 +30,9 @@ class MultSpeak:
         self.listening = False
         self.recognizer = sr.Recognizer()
         self.audio_queue = queue.Queue()
+
+        # Update the GUI with existing speakers
+        self.update_user_display()
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -93,19 +96,111 @@ class MultSpeak:
 
             threading.Thread(target=process).start()
 
-    def register_user(self, audio, sample_rate, user_name):
+    def register_user(self, audio, sample_rate, user_name, augment=True):
         """Register a new user to the database"""
         try:
             self.gui.update_status(f"Registering user: {user_name}")
+
+            # Extract embedding from the original audio
             embedding = self.voice_processor.extract_embedding(audio, sample_rate)
-            self.speaker_db.add_speaker(user_name, embedding)
+
+            # Add the speaker with the embedding and raw audio
+            self.speaker_db.add_speaker(user_name, embedding, audio, sample_rate)
+
+            # Create augmented samples if requested
+            if augment:
+                self.gui.update_status("Creating augmented samples...")
+                augmented_samples = self.voice_processor.augment_audio(audio, sample_rate)
+
+                # Add each augmented sample
+                for aug_audio, aug_sr in augmented_samples:
+                    aug_embedding = self.voice_processor.extract_embedding(aug_audio, aug_sr)
+                    self.speaker_db.add_speaker(user_name, aug_embedding, aug_audio, aug_sr)
+
+                self.gui.update_status(f"Added {len(augmented_samples)} augmented samples")
+
+            # Save the updated database
             self.speaker_db.save_database('speaker_database.pkl')
+
+            # Update the GUI
+            self.update_user_display()
+
             self.gui.update_status(f"User {user_name} registered successfully!")
-            self.gui.update_user_list(list(self.speaker_db.speakers.keys()))
             return True
         except Exception as e:
             self.gui.show_error(f"Error registering user: {str(e)}")
             return False
+
+    def delete_selected_user(self):
+        """Delete the selected user from the database"""
+        # Get the selected item from the treeview
+        selected_items = self.gui.users_list.selection()
+        if not selected_items:
+            self.gui.show_error("No user selected!")
+            return
+
+        # Get the username from the selected item
+        user_name = self.gui.users_list.item(selected_items[0])['values'][0]
+
+        # Confirm deletion
+        confirm = messagebox.askyesno(
+            "Confirm Deletion",
+            f"Are you sure you want to delete user '{user_name}' and all associated voice samples?"
+        )
+
+        if confirm:
+            # Delete the user from the database
+            if self.speaker_db.remove_speaker(user_name):
+                self.gui.update_status(f"User {user_name} deleted successfully!")
+                # Save the updated database
+                self.speaker_db.save_database('speaker_database.pkl')
+                # Update the GUI
+                self.update_user_display()
+            else:
+                self.gui.show_error(f"Failed to delete user: {user_name}")
+
+    def train_voice_processor(self):
+        """Train the voice processor scaler using all available samples"""
+        try:
+            # Get all raw audio samples from the database
+            all_samples = self.speaker_db.get_all_raw_audio_samples()
+
+            if not all_samples:
+                self.gui.show_error("No audio samples available! Please add user samples first.")
+                return
+
+            self.gui.update_status("Training voice processor...")
+
+            # Start the progress bar
+            self.gui.progress_bar.start()
+
+            # Train the scaler in a separate thread to avoid blocking the GUI
+            def train_thread():
+                try:
+                    success = self.voice_processor.train_scaler(all_samples)
+
+                    if success:
+                        self.gui.update_status("Voice processor trained successfully!")
+                    else:
+                        self.gui.show_error("Failed to train voice processor!")
+
+                    # Stop the progress bar
+                    self.gui.progress_bar.stop()
+                except Exception as e:
+                    self.gui.show_error(f"Error training voice processor: {str(e)}")
+                    self.gui.progress_bar.stop()
+
+            threading.Thread(target=train_thread).start()
+
+        except Exception as e:
+            self.gui.show_error(f"Error training voice processor: {str(e)}")
+            self.gui.progress_bar.stop()
+
+    def update_user_display(self):
+        """Update the user list display with sample counts"""
+        users = list(self.speaker_db.speakers.keys())
+        sample_counts = {user: self.speaker_db.get_speaker_samples_count(user) for user in users}
+        self.gui.update_user_list(users, sample_counts)
 
     def start_real_time_recognition(self):
         """Start real-time speech recognition and speaker identification"""
@@ -177,9 +272,17 @@ class MultSpeak:
             # Get speech-to-text
             text = self.recognizer.recognize_google(audio)
 
-            # Identify speaker
+            # Extract embedding
             embedding = self.voice_processor.extract_embedding(audio_data, audio.sample_rate)
-            speaker_name, confidence = self.speaker_db.find_closest_match(embedding)
+
+            # Get threshold value from GUI
+            threshold_value = self.gui.threshold_var.get() / 100.0
+
+            # Identify speaker
+            speaker_name, confidence = self.speaker_db.find_closest_match(
+                embedding,
+                threshold=threshold_value
+            )
 
             # Format confidence as percentage
             confidence_pct = int(confidence * 100)
