@@ -1,304 +1,210 @@
 import os
+import numpy as np
+import sounddevice as sd
+import librosa
 import tkinter as tk
 from tkinter import filedialog, messagebox
-import numpy as np
-import librosa
-import sounddevice as sd
 import threading
 import time
-import speech_recognition as sr
-import queue
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib
+
+matplotlib.use("TkAgg")
+
 from voice_processor import VoiceProcessor
 from speaker_database import SpeakerDatabase
-from gui import GUI
+from speaker_diarization import SpeakerDiarization
 
 
-class MultSpeak:
+class SpeakerRecognitionSystem:
     def __init__(self):
+        # Initialize components
         self.voice_processor = VoiceProcessor()
         self.speaker_db = SpeakerDatabase()
+        self.diarization = SpeakerDiarization(self.voice_processor, self.speaker_db)
 
-        # Load existing database if available
-        if os.path.exists('speaker_database.pkl'):
-            self.speaker_db.load_database('speaker_database.pkl')
+        # Default settings
+        self.sample_rate = 16000
+        self.db_file = "speaker_database.pkl"
+        self.recording = False
+        self.recorded_audio = None
+        self.current_speaker = None
 
-        # Initialize GUI
-        self.root = tk.Tk()
-        self.gui = GUI(self.root, self)
+        # Load database if exists
+        self.load_database()
 
-        # For real-time processing
-        self.listening = False
-        self.recognizer = sr.Recognizer()
-        self.audio_queue = queue.Queue()
+        # Train scaler if we have data
+        if self.speaker_db.raw_audio:
+            samples = self.speaker_db.get_all_raw_audio_samples()
+            if samples:
+                self.voice_processor.train_scaler(samples)
 
-        # Update the GUI with existing speakers
-        self.update_user_display()
+    def load_database(self):
+        """Load speaker database from file"""
+        if os.path.exists(self.db_file):
+            success = self.speaker_db.load_database(self.db_file)
+            return success
+        return False
 
-    def run(self):
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.root.mainloop()
+    def save_database(self):
+        """Save speaker database to file"""
+        self.speaker_db.save_database(self.db_file)
 
-    def on_closing(self):
-        """Handle when the window is closed"""
-        self.stop_listening()
-        self.root.destroy()
-
-    def record_sample(self, duration=10):
-        """Record a voice sample for the specified duration"""
-        self.gui.update_status("Recording voice sample... Please speak now")
-
-        # Setup recording parameters
-        sample_rate = 16000
-        recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1)
-
-        # Show recording progress
-        for i in range(duration):
-            self.gui.update_status(f"Recording... {duration - i} seconds remaining")
-            time.sleep(1)
-
+    def start_recording(self, duration=5):
+        """Start recording audio"""
+        self.recording = True
+        print(f"Recording for {duration} seconds...")
+        audio = sd.rec(int(duration * self.sample_rate),
+                       samplerate=self.sample_rate,
+                       channels=1,
+                       dtype='float32')
         sd.wait()
-        self.gui.update_status("Recording complete!")
+        self.recording = False
+        self.recorded_audio = audio.flatten()
+        print("Recording complete!")
+        return self.recorded_audio
 
-        return recording.flatten(), sample_rate
-
-    def process_audio_file(self, file_path):
-        """Process an uploaded audio file"""
+    def load_audio_file(self, file_path):
+        """Load audio from file"""
         try:
-            self.gui.update_status(f"Processing audio file: {os.path.basename(file_path)}")
-            audio, sample_rate = librosa.load(file_path, sr=None)
-            return audio, sample_rate
+            audio, sr = librosa.load(file_path, sr=None)
+            if sr != self.sample_rate:
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sample_rate)
+            self.recorded_audio = audio
+            return audio, self.sample_rate
         except Exception as e:
-            self.gui.show_error(f"Error processing audio file: {str(e)}")
+            print(f"Error loading audio file: {str(e)}")
             return None, None
 
-    def add_user_sample(self):
-        """Add a user voice sample"""
+    def process_audio(self, audio=None, sample_rate=None):
+        """Process audio and extract embedding"""
+        if audio is None:
+            audio = self.recorded_audio
+        if sample_rate is None:
+            sample_rate = self.sample_rate
 
-        def process():
-            audio, sample_rate = self.record_sample()
-            if audio is not None:
-                self.gui.prompt_for_user_name(audio, sample_rate)
+        # Preprocess audio
+        audio, sample_rate = self.voice_processor.preprocess_audio(audio, sample_rate)
 
-        threading.Thread(target=process).start()
+        # Extract embedding
+        embedding = self.voice_processor.extract_embedding(audio, sample_rate)
 
-    def add_user_from_file(self):
-        """Add a user voice sample from file"""
-        file_path = filedialog.askopenfilename(
-            title="Select Audio File",
-            filetypes=[("Audio Files", "*.wav *.mp3 *.ogg")]
-        )
+        return audio, sample_rate, embedding
 
-        if file_path:
-            def process():
-                audio, sample_rate = self.process_audio_file(file_path)
-                if audio is not None:
-                    self.gui.prompt_for_user_name(audio, sample_rate)
+    def add_speaker(self, speaker_name, audio=None, sample_rate=None):
+        """Add a new speaker to the database"""
+        if audio is None:
+            audio = self.recorded_audio
+        if sample_rate is None:
+            sample_rate = self.sample_rate
 
-            threading.Thread(target=process).start()
-
-    def register_user(self, audio, sample_rate, user_name, augment=True):
-        """Register a new user to the database"""
-        try:
-            self.gui.update_status(f"Registering user: {user_name}")
-
-            # Extract embedding from the original audio
-            embedding = self.voice_processor.extract_embedding(audio, sample_rate)
-
-            # Add the speaker with the embedding and raw audio
-            self.speaker_db.add_speaker(user_name, embedding, audio, sample_rate)
-
-            # Create augmented samples if requested
-            if augment:
-                self.gui.update_status("Creating augmented samples...")
-                augmented_samples = self.voice_processor.augment_audio(audio, sample_rate)
-
-                # Add each augmented sample
-                for aug_audio, aug_sr in augmented_samples:
-                    aug_embedding = self.voice_processor.extract_embedding(aug_audio, aug_sr)
-                    self.speaker_db.add_speaker(user_name, aug_embedding, aug_audio, aug_sr)
-
-                self.gui.update_status(f"Added {len(augmented_samples)} augmented samples")
-
-            # Save the updated database
-            self.speaker_db.save_database('speaker_database.pkl')
-
-            # Update the GUI
-            self.update_user_display()
-
-            self.gui.update_status(f"User {user_name} registered successfully!")
-            return True
-        except Exception as e:
-            self.gui.show_error(f"Error registering user: {str(e)}")
+        if audio is None:
+            print("No audio recorded or loaded")
             return False
 
-    def delete_selected_user(self):
-        """Delete the selected user from the database"""
-        # Get the selected item from the treeview
-        selected_items = self.gui.users_list.selection()
-        if not selected_items:
-            self.gui.show_error("No user selected!")
-            return
+        # Process audio and extract embedding
+        audio, sample_rate, embedding = self.process_audio(audio, sample_rate)
 
-        # Get the username from the selected item
-        user_name = self.gui.users_list.item(selected_items[0])['values'][0]
+        # Add to database
+        self.speaker_db.add_speaker(speaker_name, embedding, raw_audio=audio, sample_rate=sample_rate)
 
-        # Confirm deletion
-        confirm = messagebox.askyesno(
-            "Confirm Deletion",
-            f"Are you sure you want to delete user '{user_name}' and all associated voice samples?"
-        )
+        # Save database
+        self.save_database()
 
-        if confirm:
-            # Delete the user from the database
-            if self.speaker_db.remove_speaker(user_name):
-                self.gui.update_status(f"User {user_name} deleted successfully!")
-                # Save the updated database
-                self.speaker_db.save_database('speaker_database.pkl')
-                # Update the GUI
-                self.update_user_display()
-            else:
-                self.gui.show_error(f"Failed to delete user: {user_name}")
+        # Train scaler if this is the first speaker
+        if len(self.speaker_db.speakers) == 1:
+            samples = self.speaker_db.get_all_raw_audio_samples()
+            self.voice_processor.train_scaler(samples)
 
-    def train_voice_processor(self):
-        """Train the voice processor scaler using all available samples"""
-        try:
-            # Get all raw audio samples from the database
-            all_samples = self.speaker_db.get_all_raw_audio_samples()
+        return True
 
-            if not all_samples:
-                self.gui.show_error("No audio samples available! Please add user samples first.")
-                return
+    def identify_speaker(self, audio=None, sample_rate=None):
+        """Identify the speaker in the audio"""
+        if audio is None:
+            audio = self.recorded_audio
+        if sample_rate is None:
+            sample_rate = self.sample_rate
 
-            self.gui.update_status("Training voice processor...")
+        if audio is None:
+            print("No audio recorded or loaded")
+            return None, 0
 
-            # Start the progress bar
-            self.gui.progress_bar.start()
+        # Process audio and extract embedding
+        audio, sample_rate, embedding = self.process_audio(audio, sample_rate)
 
-            # Train the scaler in a separate thread to avoid blocking the GUI
-            def train_thread():
-                try:
-                    success = self.voice_processor.train_scaler(all_samples)
+        # Find closest match
+        speaker_name, confidence = self.speaker_db.find_closest_match(embedding)
 
-                    if success:
-                        self.gui.update_status("Voice processor trained successfully!")
-                    else:
-                        self.gui.show_error("Failed to train voice processor!")
+        return speaker_name, confidence
 
-                    # Stop the progress bar
-                    self.gui.progress_bar.stop()
-                except Exception as e:
-                    self.gui.show_error(f"Error training voice processor: {str(e)}")
-                    self.gui.progress_bar.stop()
+    def perform_diarization(self, audio=None, sample_rate=None):
+        """Perform speaker diarization on audio"""
+        if audio is None:
+            audio = self.recorded_audio
+        if sample_rate is None:
+            sample_rate = self.sample_rate
 
-            threading.Thread(target=train_thread).start()
+        if audio is None:
+            print("No audio recorded or loaded")
+            return []
 
-        except Exception as e:
-            self.gui.show_error(f"Error training voice processor: {str(e)}")
-            self.gui.progress_bar.stop()
+        # Run diarization
+        results = self.diarization.diarize(audio, sample_rate)
 
-    def update_user_display(self):
-        """Update the user list display with sample counts"""
-        users = list(self.speaker_db.speakers.keys())
-        sample_counts = {user: self.speaker_db.get_speaker_samples_count(user) for user in users}
-        self.gui.update_user_list(users, sample_counts)
+        return results
 
-    def start_real_time_recognition(self):
-        """Start real-time speech recognition and speaker identification"""
-        if self.listening:
-            self.gui.show_error("Already listening!")
-            return
+    def generate_diarization_plot(self, results, figure=None):
+        """Generate a plot of diarization results"""
+        if not results:
+            return None
 
-        if not self.speaker_db.speakers:
-            self.gui.show_error("No users registered! Please add user samples first.")
-            return
+        if figure is None:
+            figure = plt.figure(figsize=(10, 4))
+        else:
+            figure.clear()
 
-        self.listening = True
-        self.gui.update_listening_status(True)
+        ax = figure.add_subplot(111)
 
-        # Start the listening thread
-        threading.Thread(target=self.listen_continuously).start()
+        # Get unique speakers
+        speakers = list(set([r[2] for r in results]))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(speakers)))
+        speaker_colors = {speaker: colors[i] for i, speaker in enumerate(speakers)}
 
-        # Start the processing thread
-        threading.Thread(target=self.process_audio_queue).start()
+        # Plot segments
+        for start, end, speaker, conf in results:
+            ax.barh(y=speaker, width=end - start, left=start,
+                    color=speaker_colors[speaker], alpha=0.7)
 
-    def stop_listening(self):
-        """Stop real-time listening"""
-        self.listening = False
-        self.gui.update_listening_status(False)
-        self.gui.update_status("Listening stopped")
+        ax.set_title("Speaker Diarization")
+        ax.set_xlabel("Time (seconds)")
+        ax.set_ylabel("Speaker")
+        ax.grid(True, linestyle='--', alpha=0.7)
 
-    def listen_continuously(self):
-        """Continuously listen for speech and add to queue"""
-        # Initialize microphone
-        mic = sr.Microphone()
+        return figure
 
-        with mic as source:
-            self.recognizer.adjust_for_ambient_noise(source)
-            self.gui.update_status("Listening for speech...")
+    def remove_speaker(self, speaker_name):
+        """Remove a speaker from the database"""
+        success = self.speaker_db.remove_speaker(speaker_name)
+        if success:
+            self.save_database()
+        return success
 
-            while self.listening:
-                try:
-                    # Listen for speech with a timeout
-                    audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=10)
-                    self.audio_queue.put(audio)
-                except sr.WaitTimeoutError:
-                    continue
-                except Exception as e:
-                    self.gui.update_status(f"Error listening: {str(e)}")
-                    time.sleep(1)
+    def get_speaker_list(self):
+        """Get list of all speakers in the database"""
+        return list(self.speaker_db.speakers.keys())
 
-    def process_audio_queue(self):
-        """Process audio from the queue"""
-        while self.listening:
-            try:
-                # Get audio from queue with timeout
-                audio = self.audio_queue.get(timeout=1)
+    def get_speaker_samples_count(self, speaker_name):
+        """Get number of samples for a speaker"""
+        return self.speaker_db.get_speaker_samples_count(speaker_name)
 
-                # Process the audio
-                self.process_speech(audio)
 
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self.gui.update_status(f"Error processing: {str(e)}")
-
-    def process_speech(self, audio):
-        """Process speech audio for transcription and speaker identification"""
-        try:
-            # Convert audio to numpy array
-            audio_data = np.frombuffer(audio.frame_data, dtype=np.int16)
-            audio_data = audio_data.astype(np.float32) / 32768.0  # Normalize to -1.0 to 1.0
-
-            # Get speech-to-text
-            text = self.recognizer.recognize_google(audio)
-
-            # Extract embedding
-            embedding = self.voice_processor.extract_embedding(audio_data, audio.sample_rate)
-
-            # Get threshold value from GUI
-            threshold_value = self.gui.threshold_var.get() / 100.0
-
-            # Identify speaker
-            speaker_name, confidence = self.speaker_db.find_closest_match(
-                embedding,
-                threshold=threshold_value
-            )
-
-            # Format confidence as percentage
-            confidence_pct = int(confidence * 100)
-
-            # Update GUI with results
-            self.gui.add_speech_message(speaker_name, text, confidence_pct)
-
-        except sr.UnknownValueError:
-            # Speech was unintelligible
-            pass
-        except sr.RequestError as e:
-            self.gui.update_status(f"Speech recognition service error: {str(e)}")
-        except Exception as e:
-            self.gui.update_status(f"Error processing speech: {str(e)}")
+def main():
+    """Main function to run the application"""
+    import gui
+    app = gui.SpeakerRecognitionGUI()
+    app.mainloop()
 
 
 if __name__ == "__main__":
-    app = MultSpeak()
-    app.run()
+    main()

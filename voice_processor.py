@@ -2,12 +2,39 @@ import numpy as np
 import librosa
 from sklearn.preprocessing import StandardScaler
 from scipy import signal
+import torch
+import torchaudio
+import os
+import urllib.request
+import zipfile
+from speechbrain.pretrained import EncoderClassifier
+from speechbrain.pretrained import SpeakerRecognition
 
 
 class VoiceProcessor:
     def __init__(self):
         self.scaler = StandardScaler()
         self.scaler_trained = False
+
+        # Initialize SpeechBrain models
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Create cache directory if it doesn't exist
+        os.makedirs("pretrained_models", exist_ok=True)
+
+        # Download and load speaker embedding model
+        self.embedding_model = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="pretrained_models/spkrec-ecapa-voxceleb",
+            run_opts={"device": self.device}
+        )
+
+        # For verification (optional)
+        self.verification_model = SpeakerRecognition.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="pretrained_models/spkrec-ecapa-voxceleb-verification",
+            run_opts={"device": self.device}
+        )
 
     def train_scaler(self, audio_samples):
         """Train the scaler on a diverse set of samples"""
@@ -32,12 +59,12 @@ class VoiceProcessor:
                 sample_rate = 16000
 
             # High-pass filter to remove low-frequency noise
-            b, a = self._butter_highpass(80, sample_rate, order=5)  # Increased from 50
+            b, a = self._butter_highpass(80, sample_rate, order=5)
             audio = self._apply_filter(b, a, audio)
 
             # Add envelope detection to remove silence
             audio_envelope = np.abs(audio)
-            threshold = 0.005  # Adjust based on your needs
+            threshold = 0.005
             audio[audio_envelope < threshold] = 0
 
             # Apply noise reduction
@@ -65,18 +92,11 @@ class VoiceProcessor:
     def _reduce_noise(self, audio, sample_rate):
         """Simple noise reduction using spectral gating"""
         try:
-            # Calculate noise profile from first 0.5 seconds or minimum audio length
             noise_len = min(int(0.5 * sample_rate), len(audio) // 4)
             if noise_len > 0:
                 noise_profile = audio[:noise_len]
-
-                # Get noise threshold
                 noise_threshold = np.mean(np.abs(noise_profile)) * 2
-
-                # Create a mask
                 mask = np.abs(audio) > noise_threshold
-
-                # Apply soft mask
                 soft_mask = np.clip(np.abs(audio) / noise_threshold - 1, 0, 1)
                 return audio * soft_mask
             return audio
@@ -85,52 +105,48 @@ class VoiceProcessor:
             return audio
 
     def extract_features(self, audio, sample_rate):
-        """Extract robust voice features"""
+        """Extract traditional acoustic features as backup"""
         audio, sample_rate = self.preprocess_audio(audio, sample_rate)
 
-        # 1. Mel-frequency cepstral coefficients (MFCCs) with delta
-        mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=24)  # Increased from 20
+        # MFCCs with delta
+        mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=24)
         delta_mfccs = librosa.feature.delta(mfccs)
         delta2_mfccs = librosa.feature.delta(mfccs, order=2)
 
         mfccs_mean = np.mean(mfccs, axis=1)
-        mfccs_std = np.std(mfccs, axis=1)  # Added std features
+        mfccs_std = np.std(mfccs, axis=1)
         delta_mfccs_mean = np.mean(delta_mfccs, axis=1)
         delta2_mfccs_mean = np.mean(delta2_mfccs, axis=1)
 
-        # 2. Mel-Spectrogram
+        # Mel-Spectrogram
         mel_spec = librosa.feature.melspectrogram(y=audio, sr=sample_rate, n_mels=128)
         mel_spec_db = librosa.power_to_db(mel_spec)
         mel_mean = np.mean(mel_spec_db, axis=1)
         mel_std = np.std(mel_spec_db, axis=1)
 
-        # 3. Spectral contrast
+        # Spectral contrast
         spectral_contrast = librosa.feature.spectral_contrast(y=audio, sr=sample_rate)
         spectral_contrast_mean = np.mean(spectral_contrast, axis=1)
 
-        # 4. Tonnetz (tonal centroid features) - removed as it might add noise
-        # tonnetz = librosa.feature.tonnetz(y=harmonic, sr=sample_rate)
-        # tonnetz_mean = np.mean(tonnetz, axis=1)
-
-        # 5. Zero Crossing Rate
+        # Zero Crossing Rate
         zero_crossing_rate = librosa.feature.zero_crossing_rate(audio)
         zcr_mean = np.mean(zero_crossing_rate)
-        zcr_std = np.std(zero_crossing_rate)  # Added std feature
+        zcr_std = np.std(zero_crossing_rate)
 
-        # 6. Root Mean Square Energy
+        # Root Mean Square Energy
         rms = librosa.feature.rms(y=audio)
         rms_mean = np.mean(rms)
-        rms_std = np.std(rms)  # Added std feature
+        rms_std = np.std(rms)
 
-        # 7. Spectral centroid (brightness of sound)
+        # Spectral centroid
         spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sample_rate)
         centroid_mean = np.mean(spectral_centroid)
 
-        # 8. Spectral bandwidth (spread of spectrum around centroid)
+        # Spectral bandwidth
         spectral_bandwidth = librosa.feature.spectral_bandwidth(y=audio, sr=sample_rate)
         bandwidth_mean = np.mean(spectral_bandwidth)
 
-        # 9. Spectral rolloff
+        # Spectral rolloff
         spectral_rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sample_rate)
         rolloff_mean = np.mean(spectral_rolloff)
 
@@ -145,21 +161,64 @@ class VoiceProcessor:
         return features
 
     def extract_embedding(self, audio, sample_rate):
-        """Extract improved voice embedding"""
-        features = self.extract_features(audio, sample_rate)
-        features = features.reshape(1, -1)
+        """Extract speaker embedding using SpeechBrain ECAPA-TDNN model"""
+        try:
+            # Preprocess audio
+            audio, sample_rate = self.preprocess_audio(audio, sample_rate)
 
-        # Check if scaler is already fitted
-        if self.scaler_trained:
-            # Use the pre-trained scaler
-            embedding = self.scaler.transform(features).flatten()
-        else:
-            # Fallback - fit on current sample (not ideal, but prevents errors)
-            print("Warning: Scaler not trained. Consider calling train_scaler() first.")
-            self.scaler.fit(features)
-            embedding = self.scaler.transform(features).flatten()
+            # Convert to tensor
+            waveform = torch.FloatTensor(audio).unsqueeze(0)
 
-        return embedding
+            # Extract embedding using SpeechBrain
+            with torch.no_grad():
+                embeddings = self.embedding_model.encode_batch(waveform)
+                embedding = embeddings[0].squeeze().cpu().numpy()
+
+            return embedding
+
+        except Exception as e:
+            print(f"Error extracting SpeechBrain embedding: {str(e)}")
+            # Fallback to traditional features
+            features = self.extract_features(audio, sample_rate)
+            features = features.reshape(1, -1)
+
+            if self.scaler_trained:
+                embedding = self.scaler.transform(features).flatten()
+            else:
+                print("Warning: Scaler not trained. Consider calling train_scaler() first.")
+                self.scaler.fit(features)
+                embedding = self.scaler.transform(features).flatten()
+
+            return embedding
+
+    def verify_speakers(self, audio1, sr1, audio2, sr2):
+        """Verify if two audio segments belong to the same speaker"""
+        try:
+            # Preprocess audio
+            audio1, sr1 = self.preprocess_audio(audio1, sr1)
+            audio2, sr2 = self.preprocess_audio(audio2, sr2)
+
+            # Convert to tensors
+            waveform1 = torch.FloatTensor(audio1).unsqueeze(0)
+            waveform2 = torch.FloatTensor(audio2).unsqueeze(0)
+
+            # Use verification model
+            score, prediction = self.verification_model.verify_batch(
+                waveform1, waveform2
+            )
+
+            return score.item(), prediction.item()
+
+        except Exception as e:
+            print(f"Error in speaker verification: {str(e)}")
+            # Fallback to cosine similarity of embeddings
+            emb1 = self.extract_embedding(audio1, sr1)
+            emb2 = self.extract_embedding(audio2, sr2)
+
+            from sklearn.metrics.pairwise import cosine_similarity
+            sim = cosine_similarity(emb1.reshape(1, -1), emb2.reshape(1, -1))[0][0]
+
+            return sim, sim > 0.5
 
     def augment_audio(self, audio, sample_rate):
         """Create augmented versions of the audio"""
