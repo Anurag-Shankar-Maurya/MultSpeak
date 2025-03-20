@@ -7,8 +7,8 @@ import torchaudio
 import os
 import urllib.request
 import zipfile
-from speechbrain.pretrained import EncoderClassifier
-from speechbrain.pretrained import SpeakerRecognition
+
+from speechbrain.inference import EncoderClassifier, SpeakerRecognition
 
 
 class VoiceProcessor:

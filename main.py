@@ -47,6 +47,54 @@ class SpeakerRecognitionSystem:
             return success
         return False
 
+    # Add this method to your SpeakerRecognitionSystem class
+
+    def speech_to_text(self, audio, sample_rate=None):
+        """Convert speech to text
+
+        Note: You'll need to integrate a speech recognition library
+        like SpeechRecognition, Whisper, etc.
+        """
+        if sample_rate is None:
+            sample_rate = self.sample_rate
+
+        try:
+            # If you're using the SpeechRecognition library:
+            import speech_recognition as sr
+            r = sr.Recognizer()
+
+            # Convert audio to the format required by SpeechRecognition
+            import io
+            import numpy as np
+            import wave
+
+            # Convert float32 numpy array to WAV bytes
+            byte_io = io.BytesIO()
+            with wave.open(byte_io, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 2 bytes = 16 bits
+                wf.setframerate(sample_rate)
+                # Convert to int16
+                audio_int16 = (audio * 32767).astype(np.int16)
+                wf.writeframes(audio_int16.tobytes())
+
+            # Convert to AudioData
+            byte_io.seek(0)
+            with sr.AudioFile(byte_io) as source:
+                audio_data = r.record(source)
+
+            # Use Google's speech recognition (or any other method)
+            text = r.recognize_google(audio_data)
+            return text
+
+        except ImportError:
+            # If speech_recognition is not installed
+            return "Speech recognition not available (install speech_recognition package)"
+        except Exception as e:
+            # If recognition fails
+            print(f"Speech recognition error: {str(e)}")
+            return "..."  # Return placeholder if recognition fails
+
     def save_database(self):
         """Save speaker database to file"""
         self.speaker_db.save_database(self.db_file)

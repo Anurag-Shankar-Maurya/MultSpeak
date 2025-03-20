@@ -2,9 +2,9 @@ import torch
 import torchaudio
 import os
 import numpy as np
-from speechbrain.pretrained import SpeakerRecognition
 from sklearn.cluster import AgglomerativeClustering
 import librosa
+from speechbrain.inference import SpeakerRecognition
 
 
 class SpeakerDiarization:
